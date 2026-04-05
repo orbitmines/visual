@@ -214,7 +214,7 @@ render_frame() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 worker_compile() {
-    local sf=$1 log=$2
+    local sf=$1 log=$2 max_size=$3
     exec >>"$log" 2>&1
     set +e
 
@@ -246,7 +246,11 @@ worker_compile() {
         # Extract the merged image from the .kra archive (it's a zip with mergedimage.png)
         local tmpdir; tmpdir=$(mktemp -d)
         if unzip -o -j "$kra" "mergedimage.png" -d "$tmpdir" >/dev/null 2>&1; then
-            if convert "$tmpdir/mergedimage.png" -quality 92 "$out_jpg"; then
+            local resize_args=()
+            if [[ -n "$max_size" ]]; then
+                resize_args=(-resize "${max_size}x${max_size}>")
+            fi
+            if convert "$tmpdir/mergedimage.png" "${resize_args[@]}" -quality 92 "$out_jpg"; then
                 echo "Exported: $out_jpg"
             else
                 echo "WARN: convert failed for $kra"
@@ -335,15 +339,26 @@ await_all() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 cmd_compile() {
+    local max_size=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --max-size) max_size="$2"; shift 2 ;;
+            --max-size=*) max_size="${1#*=}"; shift ;;
+            *) printf '%s%sUnknown option: %s%s\n' "$RED" "$BOLD" "$1" "$RST"; exit 1 ;;
+        esac
+    done
+
     local t0; t0=$(date +%s)
 
     printf '%s\e[2J' "$HIDE_CURSOR"
     refresh_cols
     NEXT_ROW=5
 
-    new_task "Export .kra → .jpg" poll_compile
+    local label="Export .kra → .jpg"
+    [[ -n "$max_size" ]] && label="Export .kra → .jpg (max ${max_size}p)"
+    new_task "$label" poll_compile
     local ci=$(( ${#T_NAME[@]} - 1 ))
-    worker_compile "${T_SF[$ci]}" "${T_LOG[$ci]}" &
+    worker_compile "${T_SF[$ci]}" "${T_LOG[$ci]}" "$max_size" &
     T_PID[$ci]=$!
 
     render_frame
@@ -392,7 +407,8 @@ usage() {
         "$BG_DARK" "$ORANGE" "$RST" "$BOLD$WHITE" "$RST" "$GRAY" "$RST"
     printf '  %sUsage:%s  ./orbitmines <domain> <command>\n\n' "$ORANGE" "$RST"
     printf '  %sCommands:%s\n' "$ORANGE" "$RST"
-    printf '    %svisual compile%s   Export all .kra files to JPEG\n\n' "$WHITE" "$RST"
+    printf '    %svisual compile%s              Export all .kra files to JPEG\n' "$WHITE" "$RST"
+    printf '    %svisual compile --max-size N%s  Resize to fit within Nx N pixels\n\n' "$WHITE" "$RST"
 }
 
 main() {
