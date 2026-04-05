@@ -1,3 +1,6 @@
 .idea
+
 *.kra-autosave.kra
 *.kra~
+
+.blend1
