@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OrbitMines CLI — Visual
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Theme ────────────────────────────────────────────────────────────────────
+RST=$'\e[0m'
+BOLD=$'\e[1m'
+DIM=$'\e[2m'
+ORANGE=$'\e[38;5;208m'
+GRAY=$'\e[38;5;245m'
+DARK=$'\e[38;5;240m'
+WHITE=$'\e[38;5;255m'
+RED=$'\e[38;5;203m'
+GREEN=$'\e[38;5;114m'
+BG_ORANGE=$'\e[48;5;208m'
+BG_DARK=$'\e[48;5;236m'
+HIDE_CURSOR=$'\e[?25l'
+SHOW_CURSOR=$'\e[?25h'
+
+SPINNER=("⣾" "⣽" "⣻" "⢿" "⡿" "⣟" "⣯" "⣷")
+SPIN_I=0
+
+# ── State ────────────────────────────────────────────────────────────────────
+declare -a T_NAME=() T_STATUS=() T_MSG=() T_LOG=() T_SF=() T_PID=() T_ROW=() T_DETAIL=() T_POLL=()
+TMPFILES=()
+NEXT_ROW=0
+NEED_FULL_REDRAW=0
+
+CLEANED_UP=false
+
+cleanup() {
+    $CLEANED_UP && return
+    CLEANED_UP=true
+    local pid
+    for pid in "${T_PID[@]+"${T_PID[@]}"}"; do
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+    done
+    for pid in "${T_PID[@]+"${T_PID[@]}"}"; do
+        [[ -n "$pid" ]] && wait "$pid" 2>/dev/null
+    done
+}
+
+on_interrupt() {
+    local -a snap_name=("${T_NAME[@]+"${T_NAME[@]}"}")
+    local -a snap_status=("${T_STATUS[@]+"${T_STATUS[@]}"}")
+    local -a snap_msg=("${T_MSG[@]+"${T_MSG[@]}"}")
+    local -a snap_log=("${T_LOG[@]+"${T_LOG[@]}"}")
+    local -a snap_sf=("${T_SF[@]+"${T_SF[@]}"}")
+    local i
+    for ((i=0; i<${#snap_name[@]}; i++)); do
+        local line; line=$(head -1 "${snap_sf[$i]}" 2>/dev/null) || true
+        if [[ "${line%%:*}" == "ERR" ]]; then
+            snap_status[$i]="error"
+            snap_msg[$i]="${line#*:}"
+        fi
+    done
+
+    cleanup
+
+    {
+        if [[ $NEXT_ROW -gt 0 ]]; then
+            printf '\e[%d;1H\e[2K' "$((NEXT_ROW + 2))"
+        fi
+        printf '%s' "$SHOW_CURSOR"
+
+        local had_errors=false
+        for ((i=0; i<${#snap_name[@]}; i++)); do
+            [[ "${snap_status[$i]}" == "error" ]] && had_errors=true
+        done
+
+        if $had_errors; then
+            printf '\n  %s%sErrors:%s\n' "$RED" "$BOLD" "$RST"
+            for ((i=0; i<${#snap_name[@]}; i++)); do
+                [[ "${snap_status[$i]}" != "error" ]] && continue
+                printf '\n  %s%s── %s ──%s\n' "$RED" "$BOLD" "${snap_name[$i]}" "$RST"
+                if [[ -s "${snap_log[$i]}" ]]; then
+                    tail -30 "${snap_log[$i]}" | while IFS= read -r l; do
+                        printf '  %s%s%s\n' "$DIM" "$l" "$RST"
+                    done
+                else
+                    printf '  %s(no log output)%s\n' "$DIM" "$RST"
+                fi
+            done
+        fi
+        printf '\n'
+    } >/dev/tty 2>/dev/null
+    exit 130
+}
+
+on_exit() {
+    cleanup
+    printf '%s' "$SHOW_CURSOR" >/dev/tty 2>/dev/null
+    local f
+    for f in "${TMPFILES[@]+"${TMPFILES[@]}"}"; do rm -f "$f" 2>/dev/null; done
+}
+trap on_exit EXIT
+trap on_interrupt INT TERM
+trap 'NEED_FULL_REDRAW=1' WINCH
+
+# ── Drawing ──────────────────────────────────────────────────────────────────
+
+BUF=""
+buf()     { BUF+="$*"; }
+buf_goto(){ BUF+=$'\e['"$1"';1H'; }
+buf_clr() { BUF+=$'\e[2K'; }
+flush()   { printf '%s' "$BUF"; BUF=""; }
+
+cached_cols=80
+refresh_cols() { cached_cols=$(tput cols 2>/dev/null || echo 80); }
+
+rule_str() {
+    local out="$DARK"
+    local i; for ((i=0; i<cached_cols; i++)); do out+="─"; done
+    out+="$RST"
+    printf '%s' "$out"
+}
+
+render_header() {
+    buf_goto 1; buf_clr; buf "$(rule_str)"
+    buf_goto 2; buf_clr
+    buf "  ${BG_DARK}${ORANGE} ▌${RST} ${BOLD}${WHITE}OrbitMines${RST} ${GRAY}Visual${RST}"
+    buf_goto 3; buf_clr; buf "$(rule_str)"
+    buf_goto 4; buf_clr
+}
+
+# ── Format helpers ───────────────────────────────────────────────────────────
+
+fmt_time() {
+    local s=$1
+    if   ((s >= 3600)); then printf '%dh %dm' $((s/3600)) $(((s%3600)/60))
+    elif ((s >= 60));   then printf '%dm %ds' $((s/60)) $((s%60))
+    else printf '%ds' "$s"; fi
+}
+
+bar_str() {
+    local pct=$1 w=$2
+    local fill=$(( pct * w / 100 )) gap=$(( w - pct * w / 100 ))
+    local out="${BG_ORANGE}${BOLD}"
+    local i; for ((i=0; i<fill; i++)); do out+=" "; done
+    out+="${RST}${BG_DARK}"
+    for ((i=0; i<gap; i++)); do out+=" "; done
+    out+="$RST"
+    printf '%s' "$out"
+}
+
+# ── Task registry ───────────────────────────────────────────────────────────
+
+new_task() {
+    local name=$1 poll_fn=$2
+    local i=${#T_NAME[@]}
+    local log; log=$(mktemp); TMPFILES+=("$log")
+    local sf;  sf=$(mktemp);  TMPFILES+=("$sf")
+
+    T_NAME+=("$name")
+    T_STATUS+=("run")
+    T_MSG+=("Waiting...")
+    T_DETAIL+=("")
+    T_LOG+=("$log")
+    T_SF+=("$sf")
+    T_PID+=("")
+    T_POLL+=("$poll_fn")
+    T_ROW+=("$NEXT_ROW")
+
+    NEXT_ROW=$((NEXT_ROW + 3))
+}
+
+render_task() {
+    local i=$1
+    local row=${T_ROW[$i]}
+
+    local icon color
+    case "${T_STATUS[$i]}" in
+        run)   icon="${SPINNER[$SPIN_I]}"; color="$ORANGE" ;;
+        done)  icon="✓"; color="$GREEN" ;;
+        error) icon="✗"; color="$RED" ;;
+    esac
+
+    buf_goto "$row"; buf_clr
+    buf "  ${color}${BOLD}${icon}${RST}  ${WHITE}${BOLD}${T_NAME[$i]}${RST}"
+
+    buf_goto $((row+1)); buf_clr
+    local msg="${T_MSG[$i]}"
+    local mx=$((cached_cols - 6))
+    ((${#msg} > mx)) && msg="${msg:0:$mx}"
+    buf "     ${GRAY}${msg}${RST}"
+
+    buf_goto $((row+2)); buf_clr
+    [[ -n "${T_DETAIL[$i]}" ]] && buf "${T_DETAIL[$i]}"
+}
+
+render_frame() {
+    refresh_cols
+    BUF=""
+
+    if ((NEED_FULL_REDRAW)); then
+        buf $'\e[2J'
+        NEED_FULL_REDRAW=0
+    fi
+
+    render_header
+    for ((i=0; i<${#T_NAME[@]}; i++)); do render_task "$i"; done
+    buf_goto "$NEXT_ROW"; buf_clr; buf "$(rule_str)"
+
+    flush
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Workers
+# ─────────────────────────────────────────────────────────────────────────────
+
+worker_compile() {
+    local sf=$1 log=$2
+    exec >>"$log" 2>&1
+    set +e
+
+    # Collect all .kra files, excluding backup/autosave files
+    mapfile -t kra_files < <(
+        find "$SCRIPT_DIR" -type f -name '*.kra' \
+            ! -name '*.kra~' \
+            ! -name '*.kra-autosave.kra' \
+            | sort
+    )
+
+    local total=${#kra_files[@]}
+    if ((total == 0)); then
+        echo "OK:0" > "$sf"
+        exit 0
+    fi
+
+    local done_count=0
+    local failed=0
+
+    for kra in "${kra_files[@]}"; do
+        local dir; dir=$(dirname "$kra")
+        local base; base=$(basename "$kra" .kra)
+        local out_jpg="$dir/${base}.jpg"
+
+        done_count=$((done_count + 1))
+        echo "EX:$done_count:$total:$base" > "$sf"
+
+        # Extract the merged image from the .kra archive (it's a zip with mergedimage.png)
+        local tmpdir; tmpdir=$(mktemp -d)
+        if unzip -o -j "$kra" "mergedimage.png" -d "$tmpdir" >/dev/null 2>&1; then
+            if convert "$tmpdir/mergedimage.png" -quality 92 "$out_jpg"; then
+                echo "Exported: $out_jpg"
+            else
+                echo "WARN: convert failed for $kra"
+                failed=$((failed + 1))
+            fi
+        else
+            # Fallback: try using krita CLI export
+            if krita --export --export-filename "$out_jpg" "$kra" 2>/dev/null; then
+                echo "Exported (krita): $out_jpg"
+            else
+                echo "WARN: failed to export $kra"
+                failed=$((failed + 1))
+            fi
+        fi
+        rm -rf "$tmpdir"
+    done
+
+    if ((failed > 0)); then
+        echo "ERR:$failed of $total files failed to export" > "$sf"
+        exit 1
+    fi
+
+    echo "OK:$total" > "$sf"
+}
+
+# ── Pollers ──────────────────────────────────────────────────────────────────
+
+poll_compile() {
+    local i=$1 sf=$2
+    local line; line=$(head -1 "$sf" 2>/dev/null) || return
+    local k="${line%%:*}" v="${line#*:}"
+
+    case "$k" in
+        EX)
+            local c="${v%%:*}" rest="${v#*:}"
+            local total="${rest%%:*}" name="${rest#*:}"
+            c=${c:-0}; total=${total:-1}
+            local pct=0
+            ((total > 0 && c > 0)) && pct=$((c * 100 / total))
+            ((pct > 100)) && pct=100
+            T_MSG[$i]="Exporting  ${c} / ${total}  ${name}"
+            local bw=$((cached_cols - 16)); ((bw < 10)) && bw=10
+            T_DETAIL[$i]="     $(bar_str "$pct" "$bw")  ${DIM}${GRAY}${pct}%${RST}"
+            ;;
+        ST)  T_MSG[$i]="$v"; T_DETAIL[$i]="" ;;
+        OK)  T_MSG[$i]="${v} files exported"; T_DETAIL[$i]="" ;;
+        ERR) T_MSG[$i]="$v"; T_DETAIL[$i]="" ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+tick_tasks() {
+    local alive=false
+    for ((i=0; i<${#T_NAME[@]}; i++)); do
+        [[ "${T_STATUS[$i]}" != "run" ]] && continue
+        local pid="${T_PID[$i]}"
+        [[ -z "$pid" ]] && { alive=true; continue; }
+
+        "${T_POLL[$i]}" "$i" "${T_SF[$i]}"
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+            local rc=0; wait "$pid" || rc=$?
+            "${T_POLL[$i]}" "$i" "${T_SF[$i]}"
+            if ((rc == 0)); then T_STATUS[$i]="done"; else T_STATUS[$i]="error"; fi
+        else
+            alive=true
+        fi
+    done
+
+    SPIN_I=$(( (SPIN_I + 1) % ${#SPINNER[@]} ))
+    render_frame
+    $alive && return 0 || return 1
+}
+
+await_all() {
+    while tick_tasks; do
+        sleep 0.2
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# visual compile
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_compile() {
+    local t0; t0=$(date +%s)
+
+    printf '%s\e[2J' "$HIDE_CURSOR"
+    refresh_cols
+    NEXT_ROW=5
+
+    new_task "Export .kra → .jpg" poll_compile
+    local ci=$(( ${#T_NAME[@]} - 1 ))
+    worker_compile "${T_SF[$ci]}" "${T_LOG[$ci]}" &
+    T_PID[$ci]=$!
+
+    render_frame
+    while true; do
+        tick_tasks || break
+        sleep 0.2
+    done
+
+    # ── Check for errors ─────────────────────────────────────────────────
+    local had_errors=false
+    for ((i=0; i<${#T_NAME[@]}; i++)); do
+        [[ "${T_STATUS[$i]}" == "error" ]] && had_errors=true
+    done
+
+    if $had_errors; then
+        printf '\e[%d;1H' "$((NEXT_ROW + 1))"
+        printf '\n  %s%sErrors:%s\n' "$RED" "$BOLD" "$RST"
+        for ((i=0; i<${#T_NAME[@]}; i++)); do
+            [[ "${T_STATUS[$i]}" != "error" ]] && continue
+            printf '\n  %s%s── %s ──%s\n' "$RED" "$BOLD" "${T_NAME[$i]}" "$RST"
+            if [[ -s "${T_LOG[$i]}" ]]; then
+                tail -30 "${T_LOG[$i]}" | while IFS= read -r l; do
+                    printf '  %s%s%s\n' "$DIM" "$l" "$RST"
+                done
+            else
+                printf '  %s(no log output)%s\n' "$DIM" "$RST"
+            fi
+        done
+        printf '\n%s' "$SHOW_CURSOR"
+        exit 1
+    fi
+
+    local elapsed=$(( $(date +%s) - t0 ))
+    printf '\e[%d;1H\e[2K' "$((NEXT_ROW + 1))"
+    printf '  %s%sDone in %s%s\n\n' "$GRAY" "$DIM" "$(fmt_time $elapsed)" "$RST"
+    printf '%s' "$SHOW_CURSOR"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry
+# ─────────────────────────────────────────────────────────────────────────────
+
+usage() {
+    printf '\n'
+    printf '  %s%s ▌%s %sOrbitMines%s %sCLI%s\n\n' \
+        "$BG_DARK" "$ORANGE" "$RST" "$BOLD$WHITE" "$RST" "$GRAY" "$RST"
+    printf '  %sUsage:%s  ./orbitmines <domain> <command>\n\n' "$ORANGE" "$RST"
+    printf '  %sCommands:%s\n' "$ORANGE" "$RST"
+    printf '    %svisual compile%s   Export all .kra files to JPEG\n\n' "$WHITE" "$RST"
+}
+
+main() {
+    if [[ $# -lt 2 ]]; then usage; exit 1; fi
+    case "$1" in
+        visual)
+            case "$2" in
+                compile) shift 2; cmd_compile "$@" ;;
+                *)   printf '%s%sUnknown command: %s%s\n' "$RED" "$BOLD" "$2" "$RST"; usage; exit 1 ;;
+            esac ;;
+        *)
+            printf '%s%sUnknown domain: %s%s\n' "$RED" "$BOLD" "$1" "$RST"; usage; exit 1 ;;
+    esac
+}
+
+main "$@"
