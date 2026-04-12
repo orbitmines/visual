@@ -276,6 +276,151 @@ worker_compile() {
     echo "OK:$total" > "$sf"
 }
 
+# ── Pinterest ────────────────────────────────────────────────────────────────
+
+PINTEREST_STATE="$SCRIPT_DIR/.pinterest-pins.json"
+PINTEREST_API="https://api.pinterest.com/v5"
+
+pinterest_get_board_id() {
+    local token=$1
+    local resp
+    resp=$(curl -sf -H "Authorization: Bearer $token" \
+        "$PINTEREST_API/boards/fadiwantstea/visual")
+    printf '%s' "$resp" | jq -r '.id'
+}
+
+pinterest_create_pin() {
+    local token=$1 board_id=$2 jpg=$3 title=$4
+    local b64; b64=$(base64 -w0 "$jpg")
+    local body
+    body=$(jq -n \
+        --arg board_id "$board_id" \
+        --arg title "$title" \
+        --arg data "$b64" \
+        '{
+            board_id: $board_id,
+            title: $title,
+            media_source: {
+                source_type: "image_base64",
+                content_type: "image/jpeg",
+                data: $data
+            }
+        }')
+    local resp
+    resp=$(curl -sf -X POST \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "$PINTEREST_API/pins")
+    printf '%s' "$resp" | jq -r '.id'
+}
+
+pinterest_delete_pin() {
+    local token=$1 pin_id=$2
+    curl -sf -X DELETE \
+        -H "Authorization: Bearer $token" \
+        "$PINTEREST_API/pins/$pin_id" >/dev/null 2>&1 || true
+}
+
+worker_publish() {
+    local sf=$1 log=$2 token=$3 board_id=$4
+    exec >>"$log" 2>&1
+    set +e
+
+    # Load existing state
+    local state="{}"
+    [[ -f "$PINTEREST_STATE" ]] && state=$(cat "$PINTEREST_STATE")
+
+    # Collect all .jpg files
+    mapfile -t jpg_files < <(
+        find "$SCRIPT_DIR" -type f -name '*.jpg' | sort
+    )
+
+    local total=${#jpg_files[@]}
+    if ((total == 0)); then
+        echo "OK:0:0:0" > "$sf"
+        exit 0
+    fi
+
+    local done_count=0 created=0 updated=0 unchanged=0
+    local new_state="$state"
+
+    for jpg in "${jpg_files[@]}"; do
+        done_count=$((done_count + 1))
+        local rel; rel=$(realpath --relative-to="$SCRIPT_DIR" "$jpg")
+        local base; base=$(basename "$jpg" .jpg)
+        local hash; hash=$(sha256sum "$jpg" | cut -d' ' -f1)
+
+        echo "EX:$done_count:$total:$base" > "$sf"
+
+        # Check existing state
+        local existing_hash; existing_hash=$(printf '%s' "$new_state" | jq -r --arg k "$rel" '.[$k].hash // ""')
+        local existing_pin; existing_pin=$(printf '%s' "$new_state" | jq -r --arg k "$rel" '.[$k].pin_id // ""')
+
+        if [[ "$existing_hash" == "$hash" && -n "$existing_pin" ]]; then
+            echo "Unchanged: $rel"
+            unchanged=$((unchanged + 1))
+            continue
+        fi
+
+        # If hash changed and pin exists, delete old pin
+        if [[ -n "$existing_pin" && "$existing_pin" != "null" ]]; then
+            echo "Updating: $rel (deleting old pin $existing_pin)"
+            pinterest_delete_pin "$token" "$existing_pin"
+            updated=$((updated + 1))
+        else
+            created=$((created + 1))
+        fi
+
+        # Create new pin
+        local pin_id
+        pin_id=$(pinterest_create_pin "$token" "$board_id" "$jpg" "$base")
+        if [[ -z "$pin_id" || "$pin_id" == "null" ]]; then
+            echo "ERR:Failed to create pin for $rel" > "$sf"
+            exit 1
+        fi
+        echo "Pinned: $rel → $pin_id"
+
+        new_state=$(printf '%s' "$new_state" | jq --arg k "$rel" --arg pin "$pin_id" --arg h "$hash" \
+            '.[$k] = {pin_id: $pin, hash: $h}')
+
+        # Rate limit: stay under 100 req/s
+        sleep 0.5
+    done
+
+    # Save updated state
+    printf '%s' "$new_state" | jq '.' > "$PINTEREST_STATE"
+
+    echo "OK:$created:$updated:$unchanged" > "$sf"
+}
+
+poll_publish() {
+    local i=$1 sf=$2
+    local line; line=$(head -1 "$sf" 2>/dev/null) || return
+    local k="${line%%:*}" v="${line#*:}"
+
+    case "$k" in
+        EX)
+            local c="${v%%:*}" rest="${v#*:}"
+            local total="${rest%%:*}" name="${rest#*:}"
+            c=${c:-0}; total=${total:-1}
+            local pct=0
+            ((total > 0 && c > 0)) && pct=$((c * 100 / total))
+            ((pct > 100)) && pct=100
+            T_MSG[$i]="Publishing  ${c} / ${total}  ${name}"
+            local bw=$((cached_cols - 16)); ((bw < 10)) && bw=10
+            T_DETAIL[$i]="     $(bar_str "$pct" "$bw")  ${DIM}${GRAY}${pct}%${RST}"
+            ;;
+        OK)
+            local created="${v%%:*}" rest="${v#*:}"
+            local updated="${rest%%:*}" unchanged="${rest#*:}"
+            T_MSG[$i]="${created} created, ${updated} updated, ${unchanged} unchanged"
+            T_DETAIL[$i]=""
+            ;;
+        ERR) T_MSG[$i]="$v"; T_DETAIL[$i]="" ;;
+    esac
+}
+
 # ── Pollers ──────────────────────────────────────────────────────────────────
 
 poll_compile() {
