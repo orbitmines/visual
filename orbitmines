@@ -543,6 +543,93 @@ cmd_compile() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# visual publish
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_publish() {
+    local max_size="" compile_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --max-size) max_size="$2"; compile_args+=(--max-size "$2"); shift 2 ;;
+            --max-size=*) max_size="${1#*=}"; compile_args+=(--max-size "$max_size"); shift ;;
+            *) printf '%s%sUnknown option: %s%s\n' "$RED" "$BOLD" "$1" "$RST"; exit 1 ;;
+        esac
+    done
+
+    # ── Check token ──────────────────────────────────────────────────────
+    if [[ -z "${PINTEREST_ACCESS_TOKEN:-}" ]]; then
+        printf '  %s%sError:%s PINTEREST_ACCESS_TOKEN environment variable is not set.\n' "$RED" "$BOLD" "$RST"
+        printf '  %sGet one at https://developers.pinterest.com/apps/%s\n\n' "$GRAY" "$RST"
+        exit 1
+    fi
+
+    # ── Step 1: Compile ──────────────────────────────────────────────────
+    cmd_compile "${compile_args[@]+"${compile_args[@]}"}"
+
+    # ── Step 2: Publish to Pinterest ─────────────────────────────────────
+    local t0; t0=$(date +%s)
+
+    printf '%s\e[2J' "$HIDE_CURSOR"
+    refresh_cols
+
+    # Reset task state for publish phase
+    T_NAME=() T_STATUS=() T_MSG=() T_LOG=() T_SF=() T_PID=() T_ROW=() T_DETAIL=() T_POLL=()
+    NEXT_ROW=5
+
+    # Resolve board ID
+    printf '  %sResolving Pinterest board...%s\n' "$GRAY" "$RST"
+    local board_id
+    board_id=$(pinterest_get_board_id "$PINTEREST_ACCESS_TOKEN")
+    if [[ -z "$board_id" || "$board_id" == "null" ]]; then
+        printf '  %s%sError:%s Could not resolve Pinterest board.\n' "$RED" "$BOLD" "$RST"
+        printf '  %sCheck your access token and board URL.%s\n\n' "$GRAY" "$RST"
+        exit 1
+    fi
+
+    printf '%s\e[2J' "$HIDE_CURSOR"
+
+    new_task "Publish to Pinterest" poll_publish
+    local pi=$(( ${#T_NAME[@]} - 1 ))
+    worker_publish "${T_SF[$pi]}" "${T_LOG[$pi]}" "$PINTEREST_ACCESS_TOKEN" "$board_id" &
+    T_PID[$pi]=$!
+
+    render_frame
+    while true; do
+        tick_tasks || break
+        sleep 0.2
+    done
+
+    # ── Check for errors ─────────────────────────────────────────────────
+    local had_errors=false
+    for ((i=0; i<${#T_NAME[@]}; i++)); do
+        [[ "${T_STATUS[$i]}" == "error" ]] && had_errors=true
+    done
+
+    if $had_errors; then
+        printf '\e[%d;1H' "$((NEXT_ROW + 1))"
+        printf '\n  %s%sErrors:%s\n' "$RED" "$BOLD" "$RST"
+        for ((i=0; i<${#T_NAME[@]}; i++)); do
+            [[ "${T_STATUS[$i]}" != "error" ]] && continue
+            printf '\n  %s%s── %s ──%s\n' "$RED" "$BOLD" "${T_NAME[$i]}" "$RST"
+            if [[ -s "${T_LOG[$i]}" ]]; then
+                tail -30 "${T_LOG[$i]}" | while IFS= read -r l; do
+                    printf '  %s%s%s\n' "$DIM" "$l" "$RST"
+                done
+            else
+                printf '  %s(no log output)%s\n' "$DIM" "$RST"
+            fi
+        done
+        printf '\n%s' "$SHOW_CURSOR"
+        exit 1
+    fi
+
+    local elapsed=$(( $(date +%s) - t0 ))
+    printf '\e[%d;1H\e[2K' "$((NEXT_ROW + 1))"
+    printf '  %s%sPublished in %s%s\n\n' "$GRAY" "$DIM" "$(fmt_time $elapsed)" "$RST"
+    printf '%s' "$SHOW_CURSOR"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -553,7 +640,11 @@ usage() {
     printf '  %sUsage:%s  ./orbitmines <domain> <command>\n\n' "$ORANGE" "$RST"
     printf '  %sCommands:%s\n' "$ORANGE" "$RST"
     printf '    %svisual compile%s              Export all .kra files to JPEG\n' "$WHITE" "$RST"
-    printf '    %svisual compile --max-size N%s  Resize to fit within Nx N pixels\n\n' "$WHITE" "$RST"
+    printf '    %svisual compile --max-size N%s  Resize to fit within NxN pixels\n' "$WHITE" "$RST"
+    printf '    %svisual publish%s              Compile + upload all JPEGs to Pinterest\n' "$WHITE" "$RST"
+    printf '    %svisual publish --max-size N%s  Compile at NxN + upload to Pinterest\n\n' "$WHITE" "$RST"
+    printf '  %sEnvironment:%s\n' "$ORANGE" "$RST"
+    printf '    %sPINTEREST_ACCESS_TOKEN%s      Required for publish command\n\n' "$WHITE" "$RST"
 }
 
 main() {
@@ -562,6 +653,7 @@ main() {
         visual)
             case "$2" in
                 compile) shift 2; cmd_compile "$@" ;;
+                publish) shift 2; cmd_publish "$@" ;;
                 *)   printf '%s%sUnknown command: %s%s\n' "$RED" "$BOLD" "$2" "$RST"; usage; exit 1 ;;
             esac ;;
         *)
